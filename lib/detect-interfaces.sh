@@ -7,6 +7,29 @@ detect_wan_iface() {
     ip -4 route show default 2>/dev/null | awk '/^default/ {print $5; exit}'
 }
 
+# Возвращает первую подсеть на интерфейсе в формате CIDR (например, "192.168.1.0/24").
+# Пустая строка, если у интерфейса нет IPv4 или интерфейс не существует.
+get_iface_subnet() {
+    local iface="$1"
+    [[ -z "$iface" ]] && return
+    # ip -4 -o addr показывает строки вида:
+    #   "2: eth0    inet 192.168.1.42/24 brd 192.168.1.255 scope global ..."
+    # Поле $4 = "192.168.1.42/24" — это IP/prefix хоста, а не подсети.
+    # Превращаем в network через python3 (доступен на Ubuntu 22/24 by default).
+    local host_cidr
+    host_cidr=$(ip -4 -o addr show dev "$iface" 2>/dev/null \
+                  | awk '{print $4; exit}')
+    [[ -z "$host_cidr" ]] && return
+    python3 - "$host_cidr" <<'PY' 2>/dev/null
+import sys, ipaddress
+try:
+    n = ipaddress.ip_network(sys.argv[1], strict=False)
+    print(f"{n.network_address}/{n.prefixlen}")
+except Exception:
+    pass
+PY
+}
+
 # Список физических интерфейсов кроме lo, docker, wg/awg, br-, veth.
 # Возвращает по одному имени на строку.
 list_physical_ifaces() {

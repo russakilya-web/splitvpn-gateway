@@ -15,19 +15,19 @@ max-lease-time 7200;       # Максимальное время аренды (2
 authoritative;             # Этот сервер — главный DHCP
 
 # Описание подсети
-subnet 192.168.1.0 netmask 255.255.255.0 {
+subnet 10.10.10.0 netmask 255.255.255.0 {
     # Пул для Split Zone (динамическая выдача)
-    range 192.168.1.50 192.168.1.199;
+    range 10.10.10.50 10.10.10.199;
     
-    option routers 192.168.1.1;           # Шлюз
-    option domain-name-servers 192.168.1.1;  # DNS (dnsmasq)
-    option broadcast-address 192.168.1.255;
+    option routers 10.10.10.1;           # Шлюз
+    option domain-name-servers 10.10.10.1;  # DNS (dnsmasq)
+    option broadcast-address 10.10.10.255;
 }
 
 # Статические привязки для устройств
 host device-name {
     hardware ethernet AA:BB:CC:DD:EE:FF;  # MAC-адрес
-    fixed-address 192.168.1.XX;           # Фиксированный IP
+    fixed-address 10.10.10.XX;           # Фиксированный IP
 }
 ```
 
@@ -35,23 +35,23 @@ host device-name {
 
 ## Текущие устройства
 
-### Bypass Zone (192.168.1.31-49)
+### Bypass Zone (10.10.10.31-49)
 
 ```bash
 # Xiaomi робот-пылесос (напрямую, без VPN)
 host xiaomi_vacuum {
     hardware ethernet f0:b0:40:5f:73:4b;
-    fixed-address 192.168.1.31;
+    fixed-address 10.10.10.31;
 }
 ```
 
-### VPN Zone (192.168.1.20-30)
+### VPN Zone (10.10.10.20-30)
 
 ```bash
 # Пример: Smart TV для Netflix
 # host samsung_tv {
 #     hardware ethernet 12:34:56:78:9a:bc;
-#     fixed-address 192.168.1.23;
+#     fixed-address 10.10.10.23;
 # }
 ```
 
@@ -80,7 +80,7 @@ sudo nano /etc/dhcp/dhcpd.conf
 # Добавить запись
 host my-device {
     hardware ethernet AA:BB:CC:DD:EE:FF;
-    fixed-address 192.168.1.XX;  # 20-30 для VPN, 31-49 для bypass
+    fixed-address 10.10.10.XX;  # 20-30 для VPN, 31-49 для bypass
 }
 ```
 
@@ -118,9 +118,9 @@ cat /var/lib/dhcp/dhcpd.leases | grep -A10 "binding state active"
 
 | Диапазон | Зона | Описание |
 |----------|------|----------|
-| 192.168.1.20-30 | VPN | Весь трафик через VPN |
-| 192.168.1.31-49 | Bypass | Весь трафик напрямую |
-| 192.168.1.50-199 | Split | По доменам (DNS-based) |
+| 10.10.10.20-30 | VPN | Весь трафик через VPN |
+| 10.10.10.31-49 | Bypass | Весь трафик напрямую |
+| 10.10.10.50-199 | Split | По доменам (DNS-based) |
 
 ---
 

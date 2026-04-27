@@ -28,15 +28,28 @@ CONFIG_FILE="/etc/vpn-split/config.env"
 WAN_IF=""
 LAN_IF=""
 VPN_IF="awg0"
-LAN_NET="192.168.1.0/24"
-LAN_IP="192.168.1.1/24"
+# LAN_NET по умолчанию НЕ задан — выбирается интерактивно с автодетектом конфликта
+# с WAN-подсетью. Если задан через --lan-net=..., интерактивный шаг пропускается.
+LAN_NET=""
+LAN_IP=""
+LAN_NET_FROM_CLI=0
 AWG_CONFIG_PATH=""
 AWG_VPN_URL=""
 ASSUME_YES=0
 
+# Безопасные кандидаты для LAN-подсети, в порядке предпочтения.
+# Подобраны так, чтобы максимально редко конфликтовать с домашними роутерами
+# (которые чаще всего сидят на 192.168.0.0/24, 192.168.1.0/24, 192.168.50.0/24).
+LAN_SUBNET_CANDIDATES=(
+    "10.10.10.0/24"
+    "172.20.10.0/24"
+    "192.168.100.0/24"
+    "10.42.42.0/24"
+)
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
-step()  { echo -e "${CYAN}[$1/8]${NC} $2"; }
+step()  { echo -e "${CYAN}[$1/9]${NC} $2"; }
 ok()    { echo -e "  ${GREEN}OK${NC} $*"; }
 warn()  { echo -e "  ${YELLOW}WARN${NC} $*"; }
 die()   { echo -e "  ${RED}ERROR${NC} $*" >&2; exit 1; }
@@ -49,7 +62,8 @@ install.sh — установка vpn-split (split VPN gateway на AmneziaWG).
   --wan=IFACE          имя WAN-интерфейса (например, enp2s0)
   --lan=IFACE          имя LAN-интерфейса (например, enp3s0)
   --vpn-if=NAME        имя AmneziaWG-интерфейса (по умолчанию awg0)
-  --lan-net=CIDR       LAN-подсеть /24 (по умолчанию 192.168.1.0/24)
+  --lan-net=CIDR       LAN-подсеть /24 (если не задано — выбор интерактивный
+                       с автодетектом конфликта с WAN, дефолт 10.10.10.0/24)
   --awg-config=PATH    путь к готовому .conf файлу AmneziaWG
   --awg-vpn-url=URL    vpn://... ссылка из AmneziaVPN
   --src=PATH           где взять исходники (по умолчанию клонируется в /opt/vpn-split/src)
@@ -64,7 +78,7 @@ parse_args() {
             --wan=*)         WAN_IF="${arg#*=}" ;;
             --lan=*)         LAN_IF="${arg#*=}" ;;
             --vpn-if=*)      VPN_IF="${arg#*=}" ;;
-            --lan-net=*)     LAN_NET="${arg#*=}" ;;
+            --lan-net=*)     LAN_NET="${arg#*=}"; LAN_NET_FROM_CLI=1 ;;
             --awg-config=*)  AWG_CONFIG_PATH="${arg#*=}" ;;
             --awg-vpn-url=*) AWG_VPN_URL="${arg#*=}" ;;
             --src=*)         SRC_DIR="${arg#*=}" ;;
@@ -73,9 +87,16 @@ parse_args() {
             *)               die "Неизвестный аргумент: $arg" ;;
         esac
     done
-    # LAN_IP вычисляется как первый IP подсети + /24
-    local prefix="${LAN_NET%.*/*}"
-    LAN_IP="${prefix}.1/24"
+}
+
+# Вычисляет LAN_IP (первый usable + /24) из LAN_NET. Вызывается после того,
+# как LAN_NET окончательно выбран (CLI / интерактив / дефолт).
+derive_lan_ip() {
+    [[ -z "$LAN_NET" ]] && die "LAN_NET не задан"
+    # shellcheck disable=SC1091
+    . "$LIB_DIR/netcalc.sh"
+    net_assert_24 "$LAN_NET" || die "LAN_NET должен быть /24, получено: $LAN_NET"
+    LAN_IP="$(net_gateway24 "$LAN_NET")/24"
 }
 
 check_os() {
@@ -195,6 +216,106 @@ choose_interfaces() {
     [[ "$WAN_IF" != "$LAN_IF" ]] || die "WAN и LAN не могут быть одним и тем же интерфейсом"
 }
 
+# Интерактивный выбор LAN-подсети с автодетектом конфликта с WAN.
+# Если LAN_NET пришёл из --lan-net=..., только проверяем на конфликт и идём дальше.
+# Иначе показываем меню: безопасные кандидаты + опция «своя».
+choose_lan_subnet() {
+    # shellcheck disable=SC1091
+    . "$LIB_DIR/detect-interfaces.sh"
+    # shellcheck disable=SC1091
+    . "$LIB_DIR/netcalc.sh"
+
+    local wan_subnet; wan_subnet="$(get_iface_subnet "$WAN_IF")"
+    if [[ -n "$wan_subnet" ]]; then
+        echo "  WAN-подсеть обнаружена: $wan_subnet"
+    else
+        warn "Не удалось определить WAN-подсеть (интерфейс ${WAN_IF} без IPv4) — детекция конфликтов пропущена"
+    fi
+
+    # Случай 1: LAN_NET задан через --lan-net=... → валидируем + проверка конфликта
+    if [[ "$LAN_NET_FROM_CLI" -eq 1 ]]; then
+        net_is_valid_24 "$LAN_NET" || die "--lan-net=$LAN_NET: ожидается формат вида 10.10.10.0/24"
+        if [[ -n "$wan_subnet" ]] && cidrs_overlap "$LAN_NET" "$wan_subnet"; then
+            die "LAN-подсеть $LAN_NET конфликтует с WAN $wan_subnet — выберите другую"
+        fi
+        ok "LAN: $LAN_NET (из --lan-net)"
+        return
+    fi
+
+    # Случай 2: --yes без --lan-net → берём первый безопасный кандидат
+    if [[ "$ASSUME_YES" -eq 1 ]]; then
+        local cand
+        for cand in "${LAN_SUBNET_CANDIDATES[@]}"; do
+            if [[ -z "$wan_subnet" ]] || ! cidrs_overlap "$cand" "$wan_subnet"; then
+                LAN_NET="$cand"
+                ok "LAN: $LAN_NET (auto, не конфликтует с WAN)"
+                return
+            fi
+        done
+        die "Все безопасные подсети-кандидаты конфликтуют с WAN ${wan_subnet} — задайте --lan-net=..."
+    fi
+
+    # Случай 3: интерактивное меню
+    local safe_candidates=() unsafe_candidates=()
+    local cand
+    for cand in "${LAN_SUBNET_CANDIDATES[@]}"; do
+        if [[ -z "$wan_subnet" ]] || ! cidrs_overlap "$cand" "$wan_subnet"; then
+            safe_candidates+=("$cand")
+        else
+            unsafe_candidates+=("$cand")
+        fi
+    done
+
+    {
+        echo ""
+        echo "  Выберите LAN-подсеть (она будет создана внутри сервера):"
+        local i=1
+        for cand in "${safe_candidates[@]}"; do
+            local mark=""
+            [[ "$i" -eq 1 ]] && mark="  [рекомендуется]"
+            printf "    %d) %-18s%s\n" "$i" "$cand" "$mark"
+            ((i++))
+        done
+        local custom_idx=$i
+        printf "    %d) Своя подсеть (ввести вручную)\n" "$custom_idx"
+        if [[ ${#unsafe_candidates[@]} -gt 0 ]]; then
+            echo ""
+            echo "  Скрыты как конфликтующие с WAN: ${unsafe_candidates[*]}"
+        fi
+    } >&2
+
+    local choice safe_count="${#safe_candidates[@]}"
+    while true; do
+        read -r -p "  Выбор [1]: " choice >&2 || choice=""
+        choice="${choice:-1}"
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            if (( choice >= 1 && choice <= safe_count )); then
+                LAN_NET="${safe_candidates[$((choice - 1))]}"
+                break
+            elif (( choice == safe_count + 1 )); then
+                # Своя подсеть
+                while true; do
+                    local custom
+                    read -r -p "  Введите подсеть (формат a.b.c.0/24): " custom >&2 || custom=""
+                    if ! net_is_valid_24 "$custom"; then
+                        echo "  ❌ Неверный формат — нужно a.b.c.0/24, например 192.168.99.0/24" >&2
+                        continue
+                    fi
+                    if [[ -n "$wan_subnet" ]] && cidrs_overlap "$custom" "$wan_subnet"; then
+                        echo "  ❌ $custom конфликтует с WAN $wan_subnet — выберите другую" >&2
+                        continue
+                    fi
+                    LAN_NET="$custom"
+                    break 2
+                done
+            fi
+        fi
+        echo "  Введите число от 1 до $((safe_count + 1))" >&2
+    done
+
+    ok "LAN: $LAN_NET"
+}
+
 import_awg() {
     # shellcheck disable=SC1091
     . "$LIB_DIR/common.sh"
@@ -264,14 +385,18 @@ main() {
     step 5 "Выбор сетевых интерфейсов"
     choose_interfaces
 
-    step 6 "Импорт AmneziaWG-конфига"
+    step 6 "Выбор LAN-подсети"
+    choose_lan_subnet
+    derive_lan_ip
+
+    step 7 "Импорт AmneziaWG-конфига"
     import_awg
 
-    step 7 "Запись /etc/vpn-split/config.env и запуск setup.sh"
+    step 8 "Запись /etc/vpn-split/config.env и запуск setup.sh"
     write_config
     run_setup
 
-    step 8 "Запуск AmneziaWG-туннеля"
+    step 9 "Запуск AmneziaWG-туннеля"
     enable_awg_service
 
     echo ""

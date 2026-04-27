@@ -33,8 +33,8 @@ def load_vpn_split_config():
         "WAN_IF": "eth0",
         "LAN_IF": "eth1",
         "VPN_IF": "awg0",
-        "LAN_NET": "192.168.1.0/24",
-        "LAN_IP": "192.168.1.1/24",
+        "LAN_NET": "10.10.10.0/24",
+        "LAN_IP": "10.10.10.1/24",
     }
     if os.path.exists(VPN_SPLIT_CONFIG):
         with open(VPN_SPLIT_CONFIG) as f:
