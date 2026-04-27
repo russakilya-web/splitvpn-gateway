@@ -1,0 +1,20 @@
+# vpn-domains.example.txt — пример списка доменов для split-зоны.
+#
+# Каждая строка — один домен. Поддерживается wildcard:
+#   *.example.com   покрывает example.com и любой *.example.com
+#
+# После правки запустите:
+#   sudo /usr/local/sbin/update-domains.sh
+# или используйте веб-интерфейс на http://<LAN_IP>:8080.
+
+# Пример: пустить YouTube через VPN, а остальное — напрямую
+# *.youtube.com
+# youtube.com
+# *.googlevideo.com
+# *.ytimg.com
+
+# Пример: Twitter / X
+# *.twitter.com
+# twitter.com
+# *.x.com
+# x.com
