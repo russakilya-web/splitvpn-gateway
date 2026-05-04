@@ -29,16 +29,30 @@ def decode_link(link: str) -> dict:
     # urlsafe_b64decode требует длину, кратную 4 — добавим padding
     pad = "=" * (-len(raw) % 4)
     try:
-        compressed = base64.urlsafe_b64decode(raw + pad)
+        blob = base64.urlsafe_b64decode(raw + pad)
     except Exception as exc:
         raise ValueError(f"base64 decode error: {exc}")
-    # AmneziaVPN использует zlib с заголовком (RFC 1950).
-    # Иногда встречается raw deflate (без заголовка) — пробуем оба варианта.
-    try:
-        plain = zlib.decompress(compressed)
-    except zlib.error:
-        plain = zlib.decompress(compressed, -zlib.MAX_WBITS)
-    return json.loads(plain.decode("utf-8"))
+
+    # Реальный формат AmneziaVPN client-share (видно в исходниках клиента):
+    #   [4 байта BE uint32 = uncompressed size] + [zlib-stream JSON]
+    # Старые версии клиента и некоторые форки кладут только zlib без префикса.
+    # Пробуем варианты в порядке "новый -> старый":
+    #   1) skip 4 bytes -> zlib (with header)
+    #   2) zlib (with header) с самого начала
+    #   3) raw deflate с самого начала
+    candidates = [
+        ("skip 4-byte prefix + zlib", blob[4:], zlib.MAX_WBITS),
+        ("zlib (with header)",        blob,     zlib.MAX_WBITS),
+        ("raw deflate",               blob,     -zlib.MAX_WBITS),
+    ]
+    last_err = None
+    for label, data, wbits in candidates:
+        try:
+            plain = zlib.decompress(data, wbits)
+            return json.loads(plain.decode("utf-8"))
+        except (zlib.error, json.JSONDecodeError) as e:
+            last_err = f"{label}: {e}"
+    raise ValueError(f"не удалось распаковать payload (попробованы все варианты). Последняя ошибка: {last_err}")
 
 
 def find_awg_section(payload: dict) -> dict:
@@ -71,6 +85,11 @@ def build_conf(cfg: dict) -> str:
 
     private_key = get("client_priv_key", "PrivateKey")
     address = get("client_ip", "Address")
+    # AmneziaVPN отдаёт client_ip без маски (например, "10.8.1.27").
+    # awg-quick этого не любит — дописываем /32 для IPv4 / /128 для IPv6 если
+    # маска отсутствует.
+    if address and "/" not in address:
+        address = f"{address}/128" if ":" in address else f"{address}/32"
     dns = get("client_dns", "DNS", default="1.1.1.1, 1.0.0.1")
     mtu = get("mtu", "MTU")
 
