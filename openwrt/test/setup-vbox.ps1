@@ -1,4 +1,4 @@
-# setup-vbox.ps1 — разворачивает OpenWRT 23.05.6 в VirtualBox на Windows.
+﻿# setup-vbox.ps1 — разворачивает OpenWRT 23.05.6 в VirtualBox на Windows.
 # Аналог setup-vbox.sh для macOS/Linux.
 #
 # Запуск (PowerShell, можно НЕ от админа):
