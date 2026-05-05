@@ -35,12 +35,21 @@ EXTERNAL_DNS="8.8.8.8"
 IP_LIST="/root/ip-list.txt"
 SLEEP_WATCH=3
 
+# На Ubuntu 26.04+ /etc/iproute2/rt_tables не создаётся автоматически —
+# создаём сами при первом обращении.
+ensure_rt_tables_file() {
+    mkdir -p /etc/iproute2
+    [[ -f /etc/iproute2/rt_tables ]] || touch /etc/iproute2/rt_tables
+}
+
 ensure_vpn_table() {
+    ensure_rt_tables_file
     grep -qs "^${VPN_TABLE_ID} ${VPN_TABLE}\b" /etc/iproute2/rt_tables \
         || echo "${VPN_TABLE_ID} ${VPN_TABLE}" >> /etc/iproute2/rt_tables
 }
 
 ensure_bypass_table() {
+    ensure_rt_tables_file
     grep -qs "^${BYPASS_TABLE_ID} ${BYPASS_TABLE}\b" /etc/iproute2/rt_tables \
         || echo "${BYPASS_TABLE_ID} ${BYPASS_TABLE}" >> /etc/iproute2/rt_tables
 }

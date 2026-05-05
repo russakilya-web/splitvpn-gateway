@@ -88,10 +88,28 @@ EOF
 
     log_msg "Применение сетевой конфигурации..."
     netplan apply || warn_msg "netplan apply не удался — возможно ${LAN_IF} не подключён"
+
+    # Ждём, пока интерфейс реально получит IP (netplan apply асинхронный).
+    # Без этого setup_dhcp() стартует isc-dhcp-server раньше времени, и тот
+    # падает с "Not configured to listen on any interfaces".
+    local lan_ip_plain="${LAN_IP%/*}"
+    local i
+    for i in $(seq 1 30); do
+        if ip -4 -o addr show dev "$LAN_IF" 2>/dev/null | grep -qF "$lan_ip_plain"; then
+            log_msg "${LAN_IF} получил $lan_ip_plain (через ${i}s)"
+            return 0
+        fi
+        sleep 1
+    done
+    warn_msg "${LAN_IF} не получил $lan_ip_plain за 30s — DHCP-сервер может упасть"
 }
 
 setup_routing_tables() {
     log_msg "Настройка таблиц маршрутизации..."
+    # На Ubuntu 26.04+ пакет iproute2 больше не создаёт /etc/iproute2/rt_tables
+    # автоматически — создаём сами, чтобы grep/echo не упали.
+    mkdir -p /etc/iproute2
+    [[ -f /etc/iproute2/rt_tables ]] || touch /etc/iproute2/rt_tables
     grep -q "^100 vpn$"    /etc/iproute2/rt_tables || echo "100 vpn"    >> /etc/iproute2/rt_tables
     grep -q "^200 bypass$" /etc/iproute2/rt_tables || echo "200 bypass" >> /etc/iproute2/rt_tables
 }
@@ -151,6 +169,20 @@ EOF
     # Бинд DHCP-сервера на LAN-интерфейс
     sed -i "s|^INTERFACESv4=.*|INTERFACESv4=\"${LAN_IF}\"|" /etc/default/isc-dhcp-server 2>/dev/null \
         || echo "INTERFACESv4=\"${LAN_IF}\"" >> /etc/default/isc-dhcp-server
+
+    # systemd-override: после netplan/network-online, автоперезапуск при падении.
+    # Решает race condition при boot, когда dhcpd стартовал быстрее netplan.
+    mkdir -p /etc/systemd/system/isc-dhcp-server.service.d
+    cat > /etc/systemd/system/isc-dhcp-server.service.d/override.conf <<'OVR'
+[Unit]
+After=network-online.target systemd-networkd.service
+Wants=network-online.target
+
+[Service]
+Restart=on-failure
+RestartSec=5
+OVR
+    systemctl daemon-reload
 
     systemctl restart isc-dhcp-server
 }

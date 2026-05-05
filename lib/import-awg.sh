@@ -89,10 +89,13 @@ import_from_vpn_url() {
 
 # Интерактивное меню выбора способа.
 # Аргументы: $1 — имя интерфейса, $2 — путь к parse-vpn-url.py.
+# Лимит — 5 попыток, чтобы при EOF на stdin (например, если запущен через
+# `curl ... | bash` без /dev/tty fallback) не уйти в бесконечный цикл.
 import_awg_interactive() {
     local iface="$1" parser="$2"
     local choice
-    while true; do
+    local attempt
+    for attempt in 1 2 3 4 5; do
         {
             echo ""
             echo "Откуда взять AmneziaWG-конфиг?"
@@ -100,7 +103,10 @@ import_awg_interactive() {
             echo "  2) Вставить vpn://… ссылку"
             echo "  3) Вставить содержимое .conf вручную (paste, Ctrl-D в конце)"
         } >&2
-        read -r -p "  Выбор [1]: " choice >&2 || choice=""
+        if ! read -r -p "  Выбор [1]: " choice >&2; then
+            err "stdin закрыт (EOF) — нечего читать. Используйте --awg-config=… или --awg-vpn-url=…"
+            return 1
+        fi
         choice="${choice:-1}"
         case "$choice" in
             1)
@@ -120,6 +126,8 @@ import_awg_interactive() {
                 echo "  Введите 1, 2 или 3" >&2
                 ;;
         esac
-        echo "  Импорт не удался — попробуйте ещё раз." >&2
+        echo "  Импорт не удался — попробуйте ещё раз (попытка ${attempt}/5)." >&2
     done
+    err "Не удалось импортировать конфиг за 5 попыток"
+    return 1
 }

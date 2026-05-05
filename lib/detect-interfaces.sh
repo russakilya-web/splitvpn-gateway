@@ -91,8 +91,13 @@ pick_interface_interactive() {
     } >&2
 
     local choice
-    while true; do
-        read -r -p "  Выбор [${default_idx}]: " choice >&2 || choice=""
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if ! read -r -p "  Выбор [${default_idx}]: " choice >&2; then
+            # EOF (например, stdin закрыт) — берём default и не зацикливаемся.
+            echo "${ifaces[$((default_idx - 1))]}"
+            return 0
+        fi
         choice="${choice:-$default_idx}"
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ifaces[@]} )); then
             echo "${ifaces[$((choice - 1))]}"
@@ -100,4 +105,6 @@ pick_interface_interactive() {
         fi
         echo "  Введите число от 1 до ${#ifaces[@]}" >&2
     done
+    echo "ERROR: не удалось выбрать интерфейс за 5 попыток" >&2
+    return 1
 }

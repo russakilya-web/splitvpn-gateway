@@ -134,14 +134,50 @@ fetch_sources() {
     ok "Скачан в $SRC_DIR"
 }
 
+add_amnezia_ppa() {
+    # PPA `ppa:amnezia/ppa` собирает amneziawg только под определённые codename
+    # (jammy=22.04, noble=24.04, oracular, plucky, questing). Свежий codename
+    # (например, resolute=26.04) ещё не имеет сборки -> 404 при apt update.
+    # Делаем fallback на noble — пакет .deb бинарно совместим с новыми Ubuntu.
+    local current_codename
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    current_codename="$VERSION_CODENAME"
+
+    local supported_codenames="jammy noble oracular plucky questing"
+    local ppa_codename="$current_codename"
+    if ! echo " $supported_codenames " | grep -qw "$current_codename"; then
+        warn "PPA amnezia/ppa не имеет сборки для $current_codename — использую noble (бинарно совместим)"
+        ppa_codename="noble"
+    fi
+
+    # add-apt-repository добавит GPG-ключ + sources file для текущего codename.
+    # GPG-ключ один общий для всех codenames PPA, а sources file перепишем.
+    add-apt-repository -y ppa:amnezia/ppa 2>/dev/null || true
+
+    if [[ "$ppa_codename" != "$current_codename" ]]; then
+        local src
+        for src in /etc/apt/sources.list.d/amnezia*.sources \
+                   /etc/apt/sources.list.d/amnezia*.list; do
+            [[ -f "$src" ]] || continue
+            sed -i "s/\b${current_codename}\b/${ppa_codename}/g" "$src"
+            # Переименуем файл, чтобы имя не вводило в заблуждение
+            local newname; newname="${src/${current_codename}/${ppa_codename}}"
+            [[ "$src" != "$newname" ]] && mv "$src" "$newname"
+            ok "PPA настроен на codename $ppa_codename ($newname)"
+        done
+    fi
+}
+
 install_packages() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get install -y -qq software-properties-common gnupg2 curl
-    # PPA с amneziawg — собирает kernel-модуль через DKMS
-    if ! apt-cache policy | grep -q "amnezia/ppa"; then
-        add-apt-repository -y ppa:amnezia/ppa
+
+    if ! apt-cache policy 2>/dev/null | grep -q "amnezia/ppa"; then
+        add_amnezia_ppa
     fi
     apt-get update -qq
+
     apt-get install -y -qq \
         amneziawg amneziawg-tools \
         dnsmasq ipset iptables-persistent \
@@ -285,18 +321,27 @@ choose_lan_subnet() {
     } >&2
 
     local choice safe_count="${#safe_candidates[@]}"
-    while true; do
-        read -r -p "  Выбор [1]: " choice >&2 || choice=""
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if ! read -r -p "  Выбор [1]: " choice >&2; then
+            # EOF — берём первый безопасный кандидат и не зацикливаемся
+            LAN_NET="${safe_candidates[0]}"
+            warn "stdin закрыт, использую дефолт: $LAN_NET"
+            break
+        fi
         choice="${choice:-1}"
         if [[ "$choice" =~ ^[0-9]+$ ]]; then
             if (( choice >= 1 && choice <= safe_count )); then
                 LAN_NET="${safe_candidates[$((choice - 1))]}"
                 break
             elif (( choice == safe_count + 1 )); then
-                # Своя подсеть
-                while true; do
+                # Своя подсеть — даём 5 попыток
+                local custom_attempt
+                for custom_attempt in 1 2 3 4 5; do
                     local custom
-                    read -r -p "  Введите подсеть (формат a.b.c.0/24): " custom >&2 || custom=""
+                    if ! read -r -p "  Введите подсеть (формат a.b.c.0/24): " custom >&2; then
+                        die "stdin закрыт при вводе custom-подсети"
+                    fi
                     if ! net_is_valid_24 "$custom"; then
                         echo "  ❌ Неверный формат — нужно a.b.c.0/24, например 192.168.99.0/24" >&2
                         continue
@@ -308,10 +353,12 @@ choose_lan_subnet() {
                     LAN_NET="$custom"
                     break 2
                 done
+                die "5 неверных попыток при вводе custom-подсети"
             fi
         fi
         echo "  Введите число от 1 до $((safe_count + 1))" >&2
     done
+    [[ -n "$LAN_NET" ]] || die "Не удалось выбрать LAN-подсеть"
 
     ok "LAN: $LAN_NET"
 }
@@ -369,6 +416,13 @@ enable_awg_service() {
 
 main() {
     parse_args "$@"
+
+    # Если запущены через `curl ... | sudo bash`, stdin занят пайпом и
+    # интерактивные read получают EOF -> зацикливаются. Открываем /dev/tty
+    # как stdin, чтобы read и `cat > tmp` корректно общались с пользователем.
+    if [[ ! -t 0 && -e /dev/tty ]]; then
+        exec < /dev/tty
+    fi
 
     step 1 "Проверка системы"
     check_os
