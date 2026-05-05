@@ -1,0 +1,205 @@
+#!/bin/sh
+# vpn-split-enforce — применяет 3 зоны (VPN/Bypass/Split) поверх AmneziaWG.
+# POSIX sh порт vpn-split-enforce.sh из Ubuntu-версии.
+#
+# Запуск: vpn-split-enforce            # one-shot apply
+#         vpn-split-enforce --watch    # daemon: пере-применяет при флапе VPN_IF
+
+. /lib/functions.sh
+
+CONFIG_NAME='vpn-split'
+SLEEP_WATCH=3
+
+log()  { logger -t vpn-split -s "$*"; }
+warn() { logger -t vpn-split -s -p user.warn "WARN: $*"; }
+err()  { logger -t vpn-split -s -p user.err "ERROR: $*"; }
+
+load_cfg() {
+	config_load "$CONFIG_NAME"
+	config_get LAN_IF          main lan_iface          'br-lan'
+	config_get VPN_IF          main vpn_iface          'awg0'
+	config_get LAN_NET         main lan_subnet         '192.168.1.0/24'
+	config_get VPN_START       main vpn_zone_start     '20'
+	config_get VPN_END         main vpn_zone_end       '30'
+	config_get BYPASS_START    main bypass_zone_start  '31'
+	config_get BYPASS_END      main bypass_zone_end    '49'
+	config_get SPLIT_START     main split_zone_start   '50'
+	config_get SPLIT_END       main split_zone_end     '199'
+	config_get EXTERNAL_DNS    main external_dns       '8.8.8.8'
+	config_get FW_MARK         main fwmark             '0x100'
+	config_get VPN_TABLE       main vpn_table          'vpn'
+	config_get VPN_TABLE_ID    main vpn_table_id       '100'
+	config_get BYPASS_TABLE    main bypass_table       'bypass'
+	config_get BYPASS_TABLE_ID main bypass_table_id    '200'
+	config_get NFTSET_NAME     main nftset_name        'vpn_domains'
+
+	# 192.168.1.0/24 -> 192.168.1
+	NET_NO_MASK="${LAN_NET%/*}"
+	LAN_PREFIX="${NET_NO_MASK%.*}"
+}
+
+get_wan_gw() {
+	ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}'
+}
+
+get_wan_if() {
+	ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}'
+}
+
+ensure_rt_tables() {
+	mkdir -p /etc/iproute2
+	[ -f /etc/iproute2/rt_tables ] || touch /etc/iproute2/rt_tables
+	grep -qs "^${VPN_TABLE_ID} ${VPN_TABLE}\$"       /etc/iproute2/rt_tables \
+		|| echo "${VPN_TABLE_ID} ${VPN_TABLE}"       >> /etc/iproute2/rt_tables
+	grep -qs "^${BYPASS_TABLE_ID} ${BYPASS_TABLE}\$" /etc/iproute2/rt_tables \
+		|| echo "${BYPASS_TABLE_ID} ${BYPASS_TABLE}" >> /etc/iproute2/rt_tables
+}
+
+# Зона VPN: для каждого IP — ip rule from <ip> lookup vpn pref 10.
+ensure_vpn_zone() {
+	log "Configuring VPN zone (${LAN_PREFIX}.${VPN_START}-${VPN_END})"
+	i="$VPN_START"
+	while [ "$i" -le "$VPN_END" ]; do
+		client_ip="${LAN_PREFIX}.${i}"
+		while ip rule del from "$client_ip" 2>/dev/null; do :; done
+		ip rule add from "$client_ip" lookup "$VPN_TABLE" priority 10 2>/dev/null
+		i=$((i + 1))
+	done
+}
+
+# Зона Bypass: ip rule + DNS-DNAT на 8.8.8.8 через nftables (fw4).
+ensure_bypass_zone() {
+	wan_gw="$(get_wan_gw)"
+	wan_if="$(get_wan_if)"
+	log "Configuring bypass zone (${LAN_PREFIX}.${BYPASS_START}-${BYPASS_END}) via ${wan_gw:-?}"
+
+	if [ -n "$wan_gw" ] && [ -n "$wan_if" ]; then
+		ip route replace default via "$wan_gw" dev "$wan_if" table "$BYPASS_TABLE" 2>/dev/null
+	fi
+
+	# Создаём nft set для исходных IP bypass-зоны (один раз, если нет)
+	nft list set inet fw4 vpn_bypass_src >/dev/null 2>&1 || \
+		nft add set inet fw4 vpn_bypass_src '{ type ipv4_addr; flags interval; }' 2>/dev/null
+
+	# Очищаем и наполняем set
+	nft flush set inet fw4 vpn_bypass_src 2>/dev/null
+	i="$BYPASS_START"
+	while [ "$i" -le "$BYPASS_END" ]; do
+		client_ip="${LAN_PREFIX}.${i}"
+		while ip rule del from "$client_ip" 2>/dev/null; do :; done
+		ip rule add from "$client_ip" lookup "$BYPASS_TABLE" priority 20 2>/dev/null
+		nft add element inet fw4 vpn_bypass_src "{ ${client_ip} }" 2>/dev/null
+		i=$((i + 1))
+	done
+
+	# DNS-DNAT: всё DNS-движение из bypass-зоны → external_dns
+	# Чистим старые vpn-split правила в dstnat и добавляем заново.
+	nft -a list chain inet fw4 dstnat 2>/dev/null \
+		| awk '/comment "vpn-split-bypass-dns"/ {match($0, /handle [0-9]+/); if (RSTART) print substr($0, RSTART+7, RLENGTH-7)}' \
+		| while read -r h; do
+			[ -n "$h" ] && nft delete rule inet fw4 dstnat handle "$h" 2>/dev/null
+		done
+	nft add rule inet fw4 dstnat ip saddr @vpn_bypass_src udp dport 53 dnat ip to "${EXTERNAL_DNS}:53" comment '"vpn-split-bypass-dns"' 2>/dev/null
+	nft add rule inet fw4 dstnat ip saddr @vpn_bypass_src tcp dport 53 dnat ip to "${EXTERNAL_DNS}:53" comment '"vpn-split-bypass-dns"' 2>/dev/null
+}
+
+# VPN routing table + fwmark rules.
+ensure_vpn_routing() {
+	ip route flush table "$VPN_TABLE" 2>/dev/null
+
+	if ip link show "$VPN_IF" >/dev/null 2>&1; then
+		ip route replace default dev "$VPN_IF" table "$VPN_TABLE" 2>/dev/null
+	else
+		warn "VPN interface $VPN_IF не поднят, роут в table $VPN_TABLE не добавлен"
+	fi
+
+	ip rule del fwmark "$FW_MARK" lookup "$VPN_TABLE" 2>/dev/null
+	ip rule add pref 100 fwmark "$FW_MARK" lookup "$VPN_TABLE" 2>/dev/null
+	ip rule add pref 110 lookup main suppress_prefixlength 0 2>/dev/null
+}
+
+# Split-зона: nftables-правила marking трафика по nftset, заполняемому dnsmasq.
+# Сам set vpn_domains должен быть объявлен через uci-defaults в /etc/config/firewall.
+ensure_split_marking() {
+	# Sanity: set должен существовать
+	if ! nft list set inet fw4 "$NFTSET_NAME" >/dev/null 2>&1; then
+		warn "nftset inet fw4 ${NFTSET_NAME} не существует — split-зона не активна"
+		warn "Ожидается, что /etc/uci-defaults/99-vpn-split создал его при первом boot"
+		return 0
+	fi
+
+	# Set исходных IP split-зоны
+	nft list set inet fw4 vpn_split_src >/dev/null 2>&1 || \
+		nft add set inet fw4 vpn_split_src '{ type ipv4_addr; flags interval; }' 2>/dev/null
+	nft flush set inet fw4 vpn_split_src 2>/dev/null
+	i="$SPLIT_START"
+	while [ "$i" -le "$SPLIT_END" ]; do
+		client_ip="${LAN_PREFIX}.${i}"
+		nft add element inet fw4 vpn_split_src "{ ${client_ip} }" 2>/dev/null
+		i=$((i + 1))
+	done
+
+	# Удаляем старые правила vpn-split в mangle_prerouting, добавляем заново
+	nft -a list chain inet fw4 mangle_prerouting 2>/dev/null \
+		| awk '/comment "vpn-split-mark"/ {match($0, /handle [0-9]+/); if (RSTART) print substr($0, RSTART+7, RLENGTH-7)}' \
+		| while read -r h; do
+			[ -n "$h" ] && nft delete rule inet fw4 mangle_prerouting handle "$h" 2>/dev/null
+		done
+	nft add rule inet fw4 mangle_prerouting ip saddr @vpn_split_src ip daddr @"${NFTSET_NAME}" meta mark set "$FW_MARK" comment '"vpn-split-mark"' 2>/dev/null
+}
+
+ensure_vpn_nat() {
+	if ip link show "$VPN_IF" >/dev/null 2>&1; then
+		nft list chain inet fw4 srcnat 2>/dev/null | grep -q "oifname \"${VPN_IF}\".*masquerade" \
+			|| nft add rule inet fw4 srcnat oifname "$VPN_IF" masquerade comment '"vpn-split-nat"' 2>/dev/null
+	fi
+}
+
+apply_once() {
+	load_cfg
+	log "=== vpn-split apply ==="
+	ensure_rt_tables
+	ensure_vpn_routing
+	ensure_vpn_zone
+	ensure_bypass_zone
+	ensure_split_marking
+	ensure_vpn_nat
+	log "=== done ==="
+}
+
+watch_loop() {
+	load_cfg
+	log "Entering watch mode: monitoring ${VPN_IF}"
+	prev_state=""
+	while true; do
+		if ip link show "$VPN_IF" >/dev/null 2>&1; then
+			state="up"
+		else
+			state="down"
+		fi
+		if [ "$state" != "$prev_state" ]; then
+			log "Detected ${VPN_IF} state change: ${prev_state:-?} -> ${state}"
+			apply_once
+			prev_state="$state"
+		else
+			# Если кто-то снёс fwmark-правило — восстановим
+			if ! ip rule show | grep -q "fwmark .* lookup ${VPN_TABLE}"; then
+				log "Reinstalling fwmark ip rule"
+				ip rule add pref 100 fwmark "$FW_MARK" lookup "$VPN_TABLE" 2>/dev/null
+			fi
+		fi
+		sleep "$SLEEP_WATCH"
+	done
+}
+
+case "${1:-}" in
+	--watch)
+		apply_once
+		watch_loop
+		;;
+	*)
+		apply_once
+		;;
+esac
+
+exit 0

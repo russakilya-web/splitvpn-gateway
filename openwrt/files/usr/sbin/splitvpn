@@ -1,0 +1,127 @@
+#!/bin/sh
+# splitvpn — управляющий CLI для split-VPN-шлюза на OpenWRT.
+# Тонкая обёртка над uci/nft/awg.
+
+. /lib/functions.sh
+
+NFTSET=vpn_domains
+
+usage() {
+	cat <<'EOF'
+Usage: splitvpn <command> [args]
+
+Commands:
+  status                          Показать состояние зон, AWG-туннеля, nftset
+  domain add <domain>             Добавить домен в split-зону (через VPN)
+  domain remove <domain>          Удалить домен из split-зоны
+  domain list                     Показать список доменов split-зоны
+  reload                          Перечитать конфиг и применить правила
+  apply                           Принудительно применить правила прямо сейчас
+
+Examples:
+  splitvpn domain add youtube.com
+  splitvpn domain add googlevideo.com
+  splitvpn status
+EOF
+}
+
+# Найти индекс секции dhcp.ipset с нашим NFTSET (создана uci-defaults).
+find_dhcp_ipset_idx() {
+	idx=0
+	# config_load + config_foreach слишком многословный для одной строки — парсим uci show.
+	uci -q show dhcp \
+		| awk -F'[][.]' -v needle="$NFTSET" '
+			/^dhcp\.@ipset\[[0-9]+\]\.name=/ {
+				gsub(/'\''/, "", $0); split($0, a, "="); name = a[2]
+				match($0, /\[[0-9]+\]/); i = substr($0, RSTART+1, RLENGTH-2)
+				if (name == needle) { print i; exit }
+			}'
+}
+
+cmd_domain_add() {
+	domain="$1"
+	[ -n "$domain" ] || { echo "ERROR: укажи домен" >&2; return 1; }
+	idx="$(find_dhcp_ipset_idx)"
+	[ -n "$idx" ] || { echo "ERROR: dhcp.ipset[$NFTSET] не найден — переустанови пакет" >&2; return 1; }
+
+	# Проверяем дубликаты
+	if uci -q get "dhcp.@ipset[$idx].domain" | tr ' ' '\n' | grep -qx "$domain"; then
+		echo "Домен $domain уже в списке"
+		return 0
+	fi
+	uci add_list "dhcp.@ipset[$idx].domain=$domain"
+	uci commit dhcp
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1
+	echo "Добавлен: $domain (dnsmasq перезагружен)"
+}
+
+cmd_domain_remove() {
+	domain="$1"
+	[ -n "$domain" ] || { echo "ERROR: укажи домен" >&2; return 1; }
+	idx="$(find_dhcp_ipset_idx)"
+	[ -n "$idx" ] || { echo "ERROR: dhcp.ipset[$NFTSET] не найден" >&2; return 1; }
+	uci del_list "dhcp.@ipset[$idx].domain=$domain"
+	uci commit dhcp
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1
+	# Очищаем set, чтобы старые IP не висели до timeout
+	nft flush set inet fw4 "$NFTSET" 2>/dev/null
+	echo "Удалён: $domain (dnsmasq перезагружен, nftset очищен)"
+}
+
+cmd_domain_list() {
+	idx="$(find_dhcp_ipset_idx)"
+	[ -n "$idx" ] || { echo "ERROR: dhcp.ipset[$NFTSET] не найден" >&2; return 1; }
+	uci -q get "dhcp.@ipset[$idx].domain" | tr ' ' '\n' | sed '/^$/d' | sort
+}
+
+cmd_status() {
+	echo "=== vpn-split config ==="
+	uci -q show vpn-split | sed 's/^/  /'
+	echo
+	echo "=== AmneziaWG ==="
+	if command -v awg >/dev/null 2>&1; then
+		awg show 2>/dev/null || echo "  awg show недоступен"
+	else
+		echo "  awg не установлен"
+	fi
+	echo
+	echo "=== ip rules ==="
+	ip rule show
+	echo
+	echo "=== route table vpn ==="
+	ip route show table vpn 2>/dev/null || echo "  пусто"
+	echo
+	echo "=== route table bypass ==="
+	ip route show table bypass 2>/dev/null || echo "  пусто"
+	echo
+	echo "=== nftset ${NFTSET} (резолвы dnsmasq) ==="
+	nft list set inet fw4 "$NFTSET" 2>/dev/null | sed 's/^/  /' || echo "  set не существует"
+	echo
+	echo "=== split-зона домены ==="
+	cmd_domain_list 2>/dev/null | sed 's/^/  /' || echo "  список пуст"
+}
+
+cmd_reload() {
+	/etc/init.d/vpn-split reload
+}
+
+cmd_apply() {
+	/usr/sbin/vpn-split-enforce
+}
+
+case "${1:-}" in
+	status)        cmd_status ;;
+	domain)
+		shift
+		case "${1:-}" in
+			add)    shift; cmd_domain_add    "$@" ;;
+			remove) shift; cmd_domain_remove "$@" ;;
+			list)   cmd_domain_list ;;
+			*)      usage; exit 1 ;;
+		esac
+		;;
+	reload)        cmd_reload ;;
+	apply)         cmd_apply ;;
+	-h|--help|help|"") usage ;;
+	*)             usage; exit 1 ;;
+esac

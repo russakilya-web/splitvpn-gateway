@@ -1,0 +1,37 @@
+#!/bin/sh /etc/rc.common
+# AmneziaWG procd init: поднимает интерфейс через awg-quick.
+# Альтернатива netifd-протоколу (требует luci-proto-amneziawg + luci-base).
+
+USE_PROCD=1
+START=85
+STOP=15
+
+IFACE=awg0
+
+start_service() {
+	[ -f "/etc/amnezia/amneziawg/${IFACE}.conf" ] || {
+		logger -t amneziawg -p user.err "Конфиг /etc/amnezia/amneziawg/${IFACE}.conf не найден"
+		return 1
+	}
+	# awg-quick добавляет себя в /var/run/wireguard, но это ничего не ломает.
+	procd_open_instance "$IFACE"
+	procd_set_param command /usr/bin/awg-quick up "$IFACE"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	# awg-quick не daemon — он отрабатывает и выходит. procd считает, что это OK.
+	procd_set_param respawn 0 0 0
+	procd_close_instance
+}
+
+stop_service() {
+	/usr/bin/awg-quick down "$IFACE" 2>/dev/null || true
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "network"
+}

@@ -1,0 +1,45 @@
+#!/bin/sh
+# uci-defaults для vpn-split: запускается ОДИН РАЗ при первом boot после установки
+# (OpenWRT удаляет файл из /etc/uci-defaults/ после успешного выполнения).
+#
+# Создаёт:
+#   - nftset vpn_domains в /etc/config/firewall (для fw4/nftables)
+#   - ссылку на тот же set в /etc/config/dhcp (чтобы dnsmasq заполнял его при резолве)
+#   - стартует сервисы в правильном порядке
+
+set -e
+
+NFTSET=vpn_domains
+
+# 1. Объявить nftset в firewall (fw4 создаст его в inet fw4)
+if ! uci -q show firewall | grep -q "name='${NFTSET}'"; then
+	uci add firewall ipset
+	uci set firewall.@ipset[-1].name="${NFTSET}"
+	uci set firewall.@ipset[-1].family='ipv4'
+	uci set firewall.@ipset[-1].match='dst_net'
+	uci set firewall.@ipset[-1].storage='hash'
+	uci commit firewall
+fi
+
+# 2. Сказать dnsmasq, чтобы он умел писать в этот set резолвы доменов.
+#    Сами домены добавляются позже через `splitvpn domain add ...`.
+if ! uci -q show dhcp | grep -q "name='${NFTSET}'"; then
+	uci add dhcp ipset
+	uci set dhcp.@ipset[-1].name="${NFTSET}"
+	uci set dhcp.@ipset[-1].family='ipv4'
+	uci set dhcp.@ipset[-1].table='fw4'
+	uci set dhcp.@ipset[-1].table_family='inet'
+	uci commit dhcp
+fi
+
+# 3. Включить сервисы (но не запускать здесь — uci-defaults крутится до network)
+/etc/init.d/amneziawg enable 2>/dev/null || true
+/etc/init.d/vpn-split  enable 2>/dev/null || true
+
+# 4. Перечитать firewall (создаст set в nftables) и dnsmasq (подхватит nftset=...)
+/etc/init.d/firewall reload 2>/dev/null || true
+/etc/init.d/dnsmasq  reload 2>/dev/null || true
+
+logger -t vpn-split "uci-defaults: bootstrap complete"
+
+exit 0
