@@ -7,7 +7,8 @@ set -e
 
 REPO_RAW="https://raw.githubusercontent.com/russakilya-web/splitvpn-gateway/master/openwrt"
 AWG_RELEASES="https://github.com/Slava-Shchipunov/awg-openwrt/releases"
-AWG_TAG="v1.0.20240916"   # последний 23.05-совместимый релиз с .ipk; обновлять по необходимости
+# Тег в awg-openwrt совпадает с версией OpenWRT (v23.05.6, v23.05.5 и т.д.)
+# Реальное значение определяется в install_amneziawg() по DISTRIB_RELEASE.
 
 log()  { echo "[install] $*"; }
 err()  { echo "[install] ERROR: $*" >&2; exit 1; }
@@ -63,27 +64,30 @@ install_packages() {
 }
 
 install_amneziawg() {
+	. /etc/openwrt_release
+	# Тег awg-openwrt = v + версия OpenWRT (например, v23.05.6)
+	awg_tag="v${DISTRIB_RELEASE}"
 	pkg_target="$(detect_target)"
-	log "Скачиваю kmod-amneziawg + amneziawg-tools для $pkg_target..."
+	log "Скачиваю kmod-amneziawg + amneziawg-tools для ${pkg_target} (тег ${awg_tag})..."
 
-	# Найти .ipk через redirect API: <release>/download/<tag>/kmod-amneziawg_<...>_<target>.ipk
-	# Имена меняются по релизам, проще скачать через wildcard-проверку:
+	# Прямые URL по шаблону: <release>/download/<tag>/<pkg>_<tag>_<target>.ipk
 	cd /tmp
-	wget -q "${AWG_RELEASES}/expanded_assets/${AWG_TAG}" -O - 2>/dev/null \
-		| grep -oE "/Slava-Shchipunov/awg-openwrt/releases/download/[^\"']+\\.ipk" \
-		| grep "${pkg_target}\\." \
-		| while read -r path; do
-			fname="${path##*/}"
-			[ -f "$fname" ] && continue
-			log "  → $fname"
-			wget -q "https://github.com${path}" -O "$fname" || rm -f "$fname"
-		done
-
-	# Если ничего не скачалось — fallback: дать пользователю инструкцию
-	count=$(ls -1 /tmp/kmod-amneziawg*.ipk /tmp/amneziawg-tools*.ipk 2>/dev/null | wc -l)
-	if [ "$count" -lt 2 ]; then
-		err "Не удалось скачать .ipk для $pkg_target. Скачай вручную с ${AWG_RELEASES}/${AWG_TAG} и поставь: opkg install ./*.ipk"
-	fi
+	for pkg in kmod-amneziawg amneziawg-tools; do
+		fname="${pkg}_${awg_tag}_${pkg_target}.ipk"
+		url="${AWG_RELEASES}/download/${awg_tag}/${fname}"
+		log "  → ${fname}"
+		rm -f "$fname"
+		# wget-ssl или uclient-fetch — оба умеют redirect; --max-redirect для подстраховки
+		if ! wget -q "$url" -O "$fname" 2>/dev/null; then
+			rm -f "$fname"
+			err "Не удалось скачать ${url}. Возможно, тег/архитектура не существуют — проверь ${AWG_RELEASES}"
+		fi
+		# Проверка что скачался реальный .ipk, а не HTML-страница 404
+		if [ ! -s "$fname" ] || head -c 4 "$fname" | grep -q '<'; then
+			rm -f "$fname"
+			err "Файл ${fname} пустой или HTML (вероятно 404). Проверь ${AWG_RELEASES}/${awg_tag}"
+		fi
+	done
 
 	log "Устанавливаю .ipk..."
 	opkg install /tmp/kmod-amneziawg*.ipk /tmp/amneziawg-tools*.ipk \
@@ -176,11 +180,27 @@ bootstrap() {
 	/etc/init.d/vpn-split   start 2>/dev/null || log "WARN: vpn-split не стартовал"
 }
 
+ensure_wget_ssl() {
+	# Проверяем что wget умеет https. Базовый busybox/uclient-fetch на свежем
+	# образе OpenWRT 23.05 х86_64 не умеет — выдаёт invalid option на простых
+	# флагах. Ставим wget-ssl сразу, чтобы дальше всё работало стабильно.
+	if wget --version 2>&1 | grep -qi 'gnu wget\|wget'; then
+		return 0
+	fi
+	if opkg list-installed 2>/dev/null | grep -q '^wget-ssl '; then
+		return 0
+	fi
+	log "Ставлю wget-ssl (нужен для https-скачивания .ipk)..."
+	opkg update >/dev/null 2>&1 || err "opkg update провалился — проверь интернет"
+	opkg install wget-ssl >/dev/null 2>&1 || err "не удалось поставить wget-ssl"
+}
+
 main() {
 	[ "$(id -u)" -eq 0 ] || err "запусти от root"
-	require wget
 	require opkg
 	check_openwrt
+	ensure_wget_ssl
+	require wget
 	install_packages
 	install_files
 	setup_awg_config
